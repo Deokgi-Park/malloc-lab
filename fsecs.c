@@ -16,7 +16,7 @@ extern int verbose; /* -v option in mdriver.c */
  * init_fsecs - initialize the timing package
  */
 void init_fsecs(void)
-{
+{ 
     Mhz = 0; /* keep gcc -Wall happy */
 
 #if USE_FCYC
