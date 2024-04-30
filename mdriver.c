@@ -154,7 +154,6 @@ int main(int argc, char **argv)
     /* temporaries used to compute the performance index */
     double secs, ops, util, avg_mm_util, avg_mm_throughput, p1, p2, perfindex;
     int numcorrect;
-    
     /* 
      * Read and interpret the command line arguments 
      */
@@ -199,6 +198,7 @@ int main(int argc, char **argv)
         }
     }
 	
+    
     /* 
      * Check and print team info 
      */
@@ -237,7 +237,6 @@ int main(int argc, char **argv)
 
     /* Initialize the timing package */
     init_fsecs();
-
     /*
      * Optionally run and evaluate the libc malloc package 
      */

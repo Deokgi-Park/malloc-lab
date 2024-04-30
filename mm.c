@@ -15,6 +15,8 @@
 #include <unistd.h>
 #include <string.h>
 
+
+
 #include "mm.h"
 #include "memlib.h"
 
@@ -74,11 +76,17 @@ team_t team = {
 
 /* rounds up to the nearest multiple of ALIGNMENT */
 /* ALIGNMENT의 가장 가까운 배수로 반올림 */
-/* 원리 : 그냥 3 비트 내릴 경우 현재 사이즈보다 작아질 수 있기 때문에 8보다 1적은 7을 더함 8일 경우는 더커짐으로 7 대입 */
+/* 원리 : 그냥 3 비트 내릴 경우 현재 사이즈보다 작아질 수 있기 때문에 8보다 1적은 7을 더함 
+  8일 경우는 더커짐으로 7 대입 */
 /* 뒤에 세비트가 111 인 경우 7을 의미함, 그런다면 해당 비트를 000으로 하면 7이하 내림이 가능 */
 #define ALIGN(size) (((size) + (ALIGNMENT-1)) & ~0x7)
 
+/* 아키텍처의 메모리 할당 사이즈를 ALIGNMENT(8)로 정렬 하기 위한 매크로 */
 #define SIZE_T_SIZE (ALIGN(sizeof(size_t)))
+
+// explicit 용 매크로
+#define PRED_FREEP(bp) (*(void**)(bp))
+#define SUCC_FREEP(bp) (*(void**)(bp + WSIZE))
 
 // 사용 힙 포인터 생성
 static char *heap_listp;
@@ -87,16 +95,35 @@ static char *last_bp;
 // LIFO 용 헤더 BP
 static char *LIFO;
 
+void putFreeBlock(void *bp){
+    SUCC_FREEP(bp) = heap_listp;
+    PRED_FREEP(bp) = NULL;
+    PRED_FREEP(heap_listp) = bp;
+    heap_listp = bp;
+}
+// free list 맨 앞에 프롤로그 블록이 존재
+void removeBlock(void *bp){
+    // 첫 번째 블록을 없앨 때
+    if(bp == heap_listp){
+        PRED_FREEP(SUCC_FREEP(bp)) = NULL;
+        heap_listp = SUCC_FREEP(bp);
+    }else{
+        SUCC_FREEP(PRED_FREEP(bp)) = SUCC_FREEP(bp);
+        PRED_FREEP(SUCC_FREEP(bp)) = PRED_FREEP(bp);
+    }
+}
+
 //find_fit
 static void *find_fit(size_t asize){
   void *bp;
-
-  for(bp = heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)){
-    if(!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp)))){
-      return bp;
-    }
+  // @@@@ explicit에서 추가 @@@@
+  // 가용리스트 내부의 유일한 할당블록인 프롤로그 블록을 만나면 종료
+  for(bp = heap_listp; GET_ALLOC(HDRP(bp)) != 1; bp = SUCC_FREEP(bp)){
+      if(GET_SIZE(HDRP(bp)) >= asize){
+          return bp;
+      }
   }
-  return NULL;
+  return NULL; // No fit
 }
 
 static void *next_fit(size_t adjusted_size) {
@@ -123,56 +150,59 @@ static void *next_fit(size_t adjusted_size) {
 
 static void place(void *bp, size_t asize){
   size_t csize = GET_SIZE(HDRP(bp));
-
-  if((csize - asize) >= (2 * DSIZE)){
-    PUT(HDRP(bp), PACK(asize,1));
-    PUT(FTRP(bp), PACK(asize,1));
-    bp = NEXT_BLKP(bp);
-    PUT(HDRP(bp), PACK(csize-asize,0));
-    PUT(FTRP(bp), PACK(csize-asize,0));
+  removeBlock(bp);
+  if ((csize - asize) >= (2*DSIZE)){
+      PUT(HDRP(bp), PACK(asize,1));//현재 크기를 헤더에 집어넣고
+      PUT(FTRP(bp), PACK(asize,1));
+      bp = NEXT_BLKP(bp);
+      PUT(HDRP(bp), PACK(csize-asize,0));
+      PUT(FTRP(bp), PACK(csize-asize,0));
+      putFreeBlock(bp); // free list 첫번째에 분할된 블럭을 넣는다.
   }
   else{
-    PUT(HDRP(bp), PACK(csize,1));
-    PUT(FTRP(bp), PACK(csize,1));
+      PUT(HDRP(bp), PACK(csize,1));
+      PUT(FTRP(bp), PACK(csize,1));
   }
 }
-
-static void *coalesce(void *bp) {
-  size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(bp)));
-  size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
-  size_t size = GET_SIZE(HDRP(bp));
-  
-  // case1: 앞, 뒤 블록 모두 할당되어 있을 때
-  if (prev_alloc && next_alloc) {
-      last_bp = bp;
-      return bp;
-  }
-
-  // case2: 앞 블록 할당, 뒷 블록 가용
-  else if (prev_alloc && !next_alloc) {
-      size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
-      PUT(HDRP(bp), PACK(size, 0));
-      PUT(FTRP(bp), PACK(size, 0));
-  }
-
-  // case3: 앞 블록 가용, 뒷 블록 할당
-  else if (!prev_alloc && next_alloc) {
-      size += GET_SIZE(HDRP(PREV_BLKP(bp)));
-      PUT(FTRP(bp), PACK(size, 0));
-      PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
-      bp = PREV_BLKP(bp);
-  }
-
-  // case4: 앞, 뒤 블록 모두 가용
-  else {
-      size += GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(FTRP(NEXT_BLKP(bp)));
-      PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
-      PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));
-      bp = PREV_BLKP(bp);
-  }
-  last_bp = bp;
-  return bp;
-} 
+//연결
+static void *coalesce(void *bp)
+{
+    size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(bp))); //이전 블록이 할당되었는지 아닌지 0 or 1
+    size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp))); //다음 블록이 할당되었는지 아닌지 0 or 1
+    size_t size = GET_SIZE(HDRP(bp)); //현재 블록 사이즈 
+    // @@@@ explicit에서 추가 @@@@
+    // case 1 - 가용블록이 없으면 조건을 추가할 필요 없다. 맨 밑에서 freelist에 넣어줌
+    // case 2
+    if(prev_alloc && !next_alloc){
+        removeBlock(NEXT_BLKP(bp)); // @@@@ explicit에서 추가 @@@@
+        size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
+        PUT(HDRP(bp), PACK(size,0));
+        PUT(FTRP(bp), PACK(size,0));//header가 바뀌었으니까 size도 바뀐다!
+    }
+    // case 3
+    else if(!prev_alloc && next_alloc){
+        removeBlock(PREV_BLKP(bp));
+        size += GET_SIZE(HDRP(PREV_BLKP(bp)));
+        bp = PREV_BLKP(bp);
+        PUT(HDRP(bp), PACK(size,0));
+        PUT(FTRP(bp), PACK(size,0));
+        // PUT(FTRP(bp), PACK(size,0));  // @@@@ explicit에서 추가 @@@@ - 여기 다르긴함
+        // PUT(HDRP(PREV_BLKP(bp)), PACK(size,0));
+        // bp = PREV_BLKP(bp); //bp를 prev로 옮겨줌
+    }
+    // case 4
+    else if(!prev_alloc && !next_alloc){
+        removeBlock(PREV_BLKP(bp));
+        removeBlock(NEXT_BLKP(bp));
+        size += GET_SIZE(HDRP(PREV_BLKP(bp))) + 
+                GET_SIZE(FTRP(NEXT_BLKP(bp)));
+        PUT(HDRP(PREV_BLKP(bp)), PACK(size,0));
+        PUT(FTRP(NEXT_BLKP(bp)), PACK(size,0));
+        bp = PREV_BLKP(bp); //bp를 prev로 옮겨줌
+    }
+    putFreeBlock(bp); // 연결이 된 블록을 free list 에 추가
+    return bp;
+}
 
 //힙데이터 입력 수행
 static void *extend_heap(size_t words){
@@ -202,6 +232,9 @@ static void *extend_heap(size_t words){
  */
 int mm_init(void)
 {
+  
+  printf("%p\n", SIZE_T_SIZE);
+  printf("%p\n", sizeof(size_t));
   //힙 메모리 16 바이트 증가가 성공했는지 체크 실패시 리턴 -1
   if((heap_listp = mem_sbrk(6*WSIZE)) == (void*)-1)
     return -1;
@@ -219,8 +252,8 @@ int mm_init(void)
   PUT(heap_listp + (5*WSIZE), PACK(0 , 1));
   //포인터 값에 2워드 전진 값을 현재 포인터로 설정 프롤로그 1 뒤
   heap_listp += (2*WSIZE);
-  //청크 사이즈에 워드를 나눈 갯수만큼 확장한 결과가 NULL이면 오류
-  if(extend_heap(CHUNKSIZE/WSIZE) == NULL)
+  //청크 사이즈에 헤더, 풋터, next, prev 를 나눈 갯수만큼 확장한 결과가 NULL이면 오류
+  if(extend_heap(CHUNKSIZE/DSIZE) == NULL)
     return -1;
   //정상 처리
   return 0;
@@ -231,7 +264,7 @@ int mm_init(void)
   mm_malloc - brk 포인터를 증가시켜 블록을 할당합니다.
   Always allocate a block whose size is a multiple of the alignment.
   항상 크기가 정렬의 배수인 블록을 할당합니다.
- */
+*/
 
 void *mm_malloc(size_t size)
 {
@@ -249,8 +282,7 @@ void *mm_malloc(size_t size)
     asize = 2 * DSIZE;
   else
     asize = DSIZE * ((size + (DSIZE) + (DSIZE-1)) / DSIZE);
-  
-  if((bp = next_fit(asize)) != NULL){
+  if((bp = find_fit(asize)) != NULL){
     place(bp, asize);
     return bp;
   }
@@ -280,37 +312,37 @@ void mm_free(void *bp)
    mm_realloc - 단순히 mm_malloc과 mm_free를 사용하여 구현됩니다.
  */
 
-// void *mm_realloc(void *ptr, size_t size)
-// {
-//     void *oldptr = ptr;
-//     void *newptr;
-//     size_t copySize;
-    
-//     newptr = mm_malloc(size);
-//     if (newptr == NULL)
-//       return NULL;
-//     //copySize = *(size_t *)((char *)oldptr - SIZE_T_SIZE);
-//     copySize = GET_SIZE(HDRP(oldptr)) - DSIZE; 
-//     if (size < copySize)
-//       copySize = size;
-//     memcpy(newptr, oldptr, copySize);
-//     mm_free(oldptr);
-//     return newptr;
-// }
-
 void *mm_realloc(void *ptr, size_t size)
 {
-    size_t oldSize = GET_SIZE(HDRP(ptr)) - DSIZE;
-    void* newptr;
-    if (size <= oldSize){
-      return ptr;
-    }
-    else{
-      newptr = mm_malloc(oldSize + ((size-oldSize)));
-      if (newptr == NULL)
-        return NULL;
-      memcpy(newptr, ptr, oldSize);
-      mm_free(ptr);
-      return newptr;
-    }
+    void *oldptr = ptr;
+    void *newptr;
+    size_t copySize;
+    
+    newptr = mm_malloc(size);
+    if (newptr == NULL)
+      return NULL;
+    //copySize = *(size_t *)((char *)oldptr - SIZE_T_SIZE);
+    copySize = GET_SIZE(HDRP(oldptr)) - DSIZE; 
+    if (size < copySize)
+      copySize = size;
+    memcpy(newptr, oldptr, copySize);
+    mm_free(oldptr);
+    return newptr;
 }
+
+// void *mm_realloc(void *ptr, size_t size)
+// {
+//     size_t oldSize = GET_SIZE(HDRP(ptr)) - DSIZE;
+//     void* newptr;
+//     if (size <= oldSize){
+//       return ptr;
+//     }
+//     else{
+//       newptr = mm_malloc(oldSize + ((size-oldSize)));
+//       if (newptr == NULL)
+//         return NULL;
+//       memcpy(newptr, ptr, oldSize);
+//       mm_free(ptr);
+//       return newptr;
+//     }
+// }
